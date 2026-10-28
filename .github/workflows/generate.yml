@@ -1,1 +1,211 @@
+name: Auto-Generate Project Files
 
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Generate files
+        run: |
+          mkdir -p backend frontend
+          
+          # 1. ドメインモデル (domain.py)
+          cat << 'EOF' > backend/domain.py
+          from typing import Generic, TypeVar, Callable, NamedTuple
+          from dataclasses import dataclass
+
+          T = TypeVar('T')
+          A = TypeVar('A')
+
+          class Position(NamedTuple):
+              x: float
+              y: float
+
+          class Velocity(NamedTuple):
+              dx: float
+              dy: float
+
+          @dataclass(frozen=True)
+          class Ball:
+              id: str
+              pos: Position
+              vel: Velocity
+              radius: float = 10.0
+
+              def step(self, width: float, height: float) -> 'Ball':
+                  nx = self.pos.x + self.vel.dx
+                  ny = self.pos.y + self.vel.dy
+                  ndx = self.vel.dx
+                  ndy = self.vel.dy
+                  if nx - self.radius <= 0 or nx + self.radius >= width:
+                      ndx = -ndx
+                      nx = max(self.radius, min(width - self.radius, nx))
+                  if ny - self.radius <= 0 or ny + self.radius >= height:
+                      ndy = -ndy
+                      ny = max(self.radius, min(height - self.radius, ny))
+                  return Ball(id=self.id, pos=Position(nx, ny), vel=Velocity(ndx, ndy), radius=self.radius)
+
+          class BallOp(Generic[A]): pass
+
+          class GetState(BallOp[Ball]):
+              def __init__(self, ball_id: str) -> None:
+                  self.ball_id = ball_id
+
+          class SaveState(BallOp[None]):
+              def __init__(self, ball: Ball) -> None:
+                  self.ball = ball
+
+          class Free(Generic[T]): pass
+
+          class Pure(Free[T]):
+              def __init__(self, value: T) -> None:
+                  self.value = value
+
+          class Bind(Free[T], Generic[A, T]):
+              def __init__(self, op: BallOp[A], cont: Callable[[A], Free[T]]) -> None:
+                  self.op = op
+                  self.cont = cont
+          EOF
+
+          # 2. SQLite インタープリタ (sqlite_interpreter.py)
+          cat << 'EOF' > backend/sqlite_interpreter.py
+          import sqlite3
+          from typing import TypeVar
+          from domain import Free, Pure, Bind, GetState, SaveState, Ball, Position, Velocity
+
+          T = TypeVar('T')
+
+          class SQLiteFreeInterpreter:
+              def __init__(self, db_path: str = ":memory:") -> None:
+                  self.conn = sqlite3.connect(db_path)
+                  self._init_db()
+
+              def _init_db(self) -> None:
+                  with self.conn:
+                      self.conn.execute("""
+                          CREATE TABLE IF NOT EXISTS ball_state (
+                              id TEXT PRIMARY KEY,
+                              x REAL NOT NULL,
+                              y REAL NOT NULL,
+                              dx REAL NOT NULL,
+                              dy REAL NOT NULL,
+                              radius REAL NOT NULL
+                          )
+                      """)
+
+              def run(self, program: Free[T]) -> T:
+                  curr = program
+                  while True:
+                      if isinstance(curr, Pure):
+                          return curr.value
+                      elif isinstance(curr, Bind):
+                          op = curr.op
+                          cont = curr.cont
+                          if isinstance(op, GetState):
+                              cursor = self.conn.cursor()
+                              cursor.execute("SELECT id, x, y, dx, dy, radius FROM ball_state WHERE id = ?", (op.ball_id,))
+                              row = cursor.fetchone()
+                              if row:
+                                  ball = Ball(id=row[0], pos=Position(row[1], row[2]), vel=Velocity(row[3], row[4]), radius=row[5])
+                              else:
+                                  ball = Ball(id=op.ball_id, pos=Position(400, 300), vel=Velocity(4, -4), radius=10.0)
+                              curr = cont(ball)
+                          elif isinstance(op, SaveState):
+                              with self.conn:
+                                  self.conn.execute("""
+                                      INSERT INTO ball_state (id, x, y, dx, dy, radius)
+                                      VALUES (?, ?, ?, ?, ?, ?)
+                                      ON CONFLICT(id) DO UPDATE SET
+                                          x=excluded.x, y=excluded.y, dx=excluded.dx, dy=excluded.dy
+                                  """, (op.ball.id, op.ball.pos.x, op.ball.pos.y, op.ball.vel.dx, op.ball.vel.dy, op.ball.radius))
+                              curr = cont(None)  # type: ignore
+                          else:
+                              raise RuntimeError("不明なオペレーション")
+                      else:
+                          raise TypeError("不正なFree構造です")
+          EOF
+
+          # 3. 受信側コンフレーション (conflator.py)
+          cat << 'EOF' > backend/conflator.py
+          import asyncio
+          from typing import Dict, Optional
+          from domain import Ball
+
+          class ReceiverConflator:
+              def __init__(self) -> None:
+                self._latest_state: Dict[str, Ball] = {}
+                self._lock = asyncio.Lock()
+
+              async def push(self, ball: Ball) -> None:
+                  async with self._lock:
+                      self._latest_state[ball.id] = ball
+
+              async def pop_latest(self, ball_id: str) -> Optional[Ball]:
+                  async with self._lock:
+                      return self._latest_state.pop(ball_id, None)
+          EOF
+
+          # 4. 依存関係リスト (requirements.txt)
+          echo "websockets==12.0" > backend/requirements.txt
+
+          # 5. フロントエンド画面 (frontend/index.html)
+          cat << 'EOF' > frontend/index.html
+          <!DOCTYPE html>
+          <html lang="ja">
+          <head>
+            <meta charset="UTF-8">
+            <title>ブロック崩しボール同期</title>
+            <style>
+              body { background: #111; color: #fff; text-align: center; font-family: sans-serif; }
+              canvas { background: #222; border: 2px solid #fff; margin-top: 20px; }
+            </style>
+          </head>
+          <body>
+            <h1>ブロック崩し：リアルタイムボール同期</h1>
+            <canvas id="gameCanvas" width="800" height="600"></canvas>
+            <script src="app.js"></script>
+          </body>
+          </html>
+          EOF
+
+          # 6. フロントエンドロジック (frontend/app.js)
+          cat << 'EOF' > frontend/app.js
+          const canvas = document.getElementById('gameCanvas');
+          const ctx = canvas.getContext('2d');
+          let ballState = { x: 400, y: 300, radius: 10 };
+
+          function render() {
+              ctx.clearRect(0, 0, canvas.width, canvas.height);
+              ctx.beginPath();
+              ctx.arc(ballState.x, ballState.y, ballState.radius, 0, Math.PI * 2);
+              ctx.fillStyle = "#00FFCC";
+              ctx.fill();
+              ctx.closePath();
+              requestAnimationFrame(render);
+          }
+          requestAnimationFrame(render);
+          EOF
+
+      - name: Commit and Push Generated Files
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: auto-generate project code" && git push)
