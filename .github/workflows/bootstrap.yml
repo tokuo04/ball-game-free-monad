@@ -1,0 +1,1230 @@
+name: FDM Ball bootstrap
+
+# 使い方: このファイルを .github/workflows/bootstrap.yml として置き、
+# Actions → "FDM Ball bootstrap" → Run workflow。全ファイルを生成してコミットし、
+# Pyright strict と unittest を通したうえで docs/ を GitHub Pages に公開します。
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "既存ファイルを上書きして再生成する"
+        type: boolean
+        default: false
+  push:
+    paths: ["fdmball/**", "tests/**", "docs/**", "pyproject.toml"]
+
+concurrency:
+  group: fdm-ball
+  cancel-in-progress: false
+
+jobs:
+  materialize:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      FORCE: ${{ inputs.force }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Skip if already materialized
+        id: gate
+        run: |
+          if [ -f fdmball/free.py ] && [ "$FORCE" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "既に生成済みです(上書きするなら force を有効にして再実行)"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Write pyproject.toml
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'pyproject.toml')"
+          cat > 'pyproject.toml' <<'__EOF__'
+          [project]
+          name = "fdmball"
+          version = "0.1.0"
+          requires-python = ">=3.10"
+
+          [tool.pyright]
+          include = ["fdmball", "tests"]
+          typeCheckingMode = "strict"
+          pythonVersion = "3.10"
+          __EOF__
+      - name: Write .gitignore
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname '.gitignore')"
+          cat > '.gitignore' <<'__EOF__'
+          __pycache__/
+          *.sqlite3
+          *.sqlite3-*
+          .venv/
+          __EOF__
+      - name: Write README.md
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'README.md')"
+          cat > 'README.md' <<'__EOF__'
+          # FDM Ball
+
+          SQLite 上の Free モナドで動かす「ブロック崩しのボールのみ」。サーバー(Python, Pyright strict)が
+          Firebase Realtime Database へ状態を配信し、GitHub Pages のブラウザが受信側コンフレーションで描画します。
+
+          ## 構成
+          - `fdmball/free.py` 汎用 Free モナド(スタック安全) / `domain.py` 純粋ドメイン(decide/evolve)
+          - `fdmball/dsl.py` 命令 Load/Emit とプログラム / `store.py` SQLite インタープリタ(snapshot+イベント再生)
+          - `fdmball/__main__.py` 命令的シェル(時計・空きポートの制御口・配信)
+          - `docs/index.html` ブラウザ(GitHub Pages)
+
+          ## 手順
+          1. Firebase で Realtime Database を作成し、`database.rules.json` を適用する。
+          2. リポジトリ変数 `FIREBASE_CONFIG_JSON` に Firebase のウェブアプリ設定(`{...}` の JSON)を登録する。
+          3. Settings → Pages → Source を「GitHub Actions」にして Actions から Run workflow。
+          4. サーバー起動(標準ライブラリのみ。Colab でも可):
+
+                 export FIREBASE_DB_URL=https://<project>-default-rtdb.firebaseio.com
+                 export FIREBASE_AUTH=<データベースシークレット>
+                 python -m fdmball --reset
+
+             起動時に OS が割り当てた空きポートが表示されます(制御口: `GET /state`, `POST /launch`)。
+          5. ブラウザで Pages の URL を開く(`?room=名前` で部屋を切替)。複数ブラウザが同じ画面を共有します。
+
+          テスト: `python -m unittest discover -s tests -t .` / 型検査: `pip install pyright && pyright`
+          __EOF__
+      - name: Write fdmball/__init__.py
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'fdmball/__init__.py')"
+          cat > 'fdmball/__init__.py' <<'__EOF__'
+          """SQLite 上の Free モナドで動く「ブロック崩しのボールのみ」(FDM 設計)。"""
+          __EOF__
+      - name: Write fdmball/free.py
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'fdmball/free.py')"
+          cat > 'fdmball/free.py' <<'__EOF__'
+          """汎用 Free モナド(ドメイン非依存・スタック安全)。
+
+          命令の型は意図的に ``object`` とし、解釈はハンドラ側が行う。
+          ``bind`` は常に ``Bind`` ノードを作るだけで評価せず、``run`` が明示的な
+          継続スタックで畳み込むため、左結合の深いチェーンでも再帰しない。
+          """
+
+          from __future__ import annotations
+
+          from dataclasses import dataclass
+          from typing import Callable, Generic, TypeVar, Union, cast
+
+          A = TypeVar("A")
+          B = TypeVar("B")
+
+          Handler = Callable[[object], object]
+
+
+          @dataclass(frozen=True)
+          class Pure(Generic[A]):
+              value: A
+
+
+          @dataclass(frozen=True)
+          class Do(Generic[A]):
+              """命令 1 つの実行。結果の型 A は幽霊型(スマートコンストラクタが保証)。"""
+
+              instr: object
+
+
+          @dataclass(frozen=True)
+          class Bind(Generic[A]):
+              src: Free[object]
+              f: Callable[[object], Free[A]]
+
+
+          Free = Union[Pure[A], Do[A], Bind[A]]
+
+
+          def pure(value: A) -> Free[A]:
+              return Pure(value)
+
+
+          def bind(m: Free[A], f: Callable[[A], Free[B]]) -> Free[B]:
+              return Bind(cast("Free[object]", m), cast("Callable[[object], Free[B]]", f))
+
+
+          def fmap(m: Free[A], f: Callable[[A], B]) -> Free[B]:
+              return bind(m, lambda a: pure(f(a)))
+
+
+          def then(m: Free[A], n: Free[B]) -> Free[B]:
+              return bind(m, lambda _: n)
+
+
+          def run(program: Free[A], handler: Handler) -> A:
+              """プログラムをハンドラで実行する。ループ+継続スタックなので再帰しない。"""
+              stack: list[Callable[[object], Free[object]]] = []
+              current: Free[object] = cast("Free[object]", program)
+              while True:
+                  if isinstance(current, Bind):
+                      stack.append(current.f)
+                      current = current.src
+                      continue
+                  value: object = current.value if isinstance(current, Pure) else handler(current.instr)
+                  if not stack:
+                      return cast(A, value)
+                  current = stack.pop()(value)
+          __EOF__
+      - name: Write fdmball/domain.py
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'fdmball/domain.py')"
+          cat > 'fdmball/domain.py' <<'__EOF__'
+          """純粋ドメイン層: Command → (decide) → Event → (evolve) → State。副作用なし。
+
+          座標は論理座標 0.0–1.0(画素変換はブラウザ側)。
+          """
+
+          from __future__ import annotations
+
+          import math
+          from dataclasses import dataclass, replace
+          from enum import Enum
+          from typing import NoReturn, Union
+
+          RADIUS = 0.02
+          MAX_DT = 0.1
+          MAX_SPEED = 3.0  # MAX_DT * MAX_SPEED < 1 - 2*RADIUS なので 1 ステップの反射は高々 1 回
+
+
+          class Axis(Enum):
+              X = "x"
+              Y = "y"
+
+
+          @dataclass(frozen=True)
+          class BallState:
+              n: int  # Moved の適用回数(単調増加。受信側の順序判定に使う)
+              x: float
+              y: float
+              vx: float
+              vy: float
+
+
+          @dataclass(frozen=True)
+          class Tick:
+              dt: float
+
+
+          @dataclass(frozen=True)
+          class Launch:
+              x: float
+              y: float
+              vx: float
+              vy: float
+
+
+          Command = Union[Tick, Launch]
+
+
+          @dataclass(frozen=True)
+          class Moved:
+              dt: float
+
+
+          @dataclass(frozen=True)
+          class Bounced:
+              axis: Axis
+
+
+          @dataclass(frozen=True)
+          class Launched:
+              x: float
+              y: float
+              vx: float
+              vy: float
+
+
+          @dataclass(frozen=True)
+          class Rejected:
+              reason: str
+
+
+          Event = Union[Moved, Bounced, Launched, Rejected]
+
+
+          def initial_state() -> BallState:
+              return BallState(n=0, x=0.5, y=0.5, vx=0.31, vy=0.47)
+
+
+          def _inside(p: float) -> bool:
+              return RADIUS <= p <= 1.0 - RADIUS
+
+
+          def _out(p: float) -> bool:
+              return p < RADIUS or p > 1.0 - RADIUS
+
+
+          def _absurd(x: NoReturn) -> NoReturn:
+              raise AssertionError(f"unhandled: {x!r}")
+
+
+          def decide(state: BallState, cmd: Command) -> tuple[Event, ...]:
+              """状態とコマンドからイベント列を決める。不正入力は Rejected イベントで表す。"""
+              if isinstance(cmd, Tick):
+                  if not (math.isfinite(cmd.dt) and 0.0 < cmd.dt <= MAX_DT):
+                      return (Rejected("invalid_dt"),)
+                  nx = state.x + state.vx * cmd.dt
+                  ny = state.y + state.vy * cmd.dt
+                  events: list[Event] = [Moved(cmd.dt)]
+                  if _out(nx):
+                      events.append(Bounced(Axis.X))
+                  if _out(ny):
+                      events.append(Bounced(Axis.Y))
+                  return tuple(events)
+              values = (cmd.x, cmd.y, cmd.vx, cmd.vy)
+              if not all(math.isfinite(v) for v in values):
+                  return (Rejected("non_finite_launch"),)
+              if not (_inside(cmd.x) and _inside(cmd.y)):
+                  return (Rejected("launch_outside_field"),)
+              if abs(cmd.vx) > MAX_SPEED or abs(cmd.vy) > MAX_SPEED:
+                  return (Rejected("launch_too_fast"),)
+              return (Launched(cmd.x, cmd.y, cmd.vx, cmd.vy),)
+
+
+          def _reflect(p: float) -> float:
+              lo, hi = RADIUS, 1.0 - RADIUS
+              if p < lo:
+                  p = 2.0 * lo - p
+              elif p > hi:
+                  p = 2.0 * hi - p
+              return min(max(p, lo), hi)
+
+
+          def evolve(state: BallState, event: Event) -> BallState:
+              """イベントを状態へ適用する唯一の関数(全イベントを網羅)。"""
+              if isinstance(event, Moved):
+                  return replace(
+                      state,
+                      n=state.n + 1,
+                      x=state.x + state.vx * event.dt,
+                      y=state.y + state.vy * event.dt,
+                  )
+              if isinstance(event, Bounced):
+                  if event.axis is Axis.X:
+                      return replace(state, x=_reflect(state.x), vx=-state.vx)
+                  return replace(state, y=_reflect(state.y), vy=-state.vy)
+              if isinstance(event, Launched):
+                  return replace(state, x=event.x, y=event.y, vx=event.vx, vy=event.vy)
+              if isinstance(event, Rejected):
+                  return state
+              return _absurd(event)
+
+
+          def fold(state: BallState, events: tuple[Event, ...]) -> BallState:
+              for event in events:
+                  state = evolve(state, event)
+              return state
+          __EOF__
+      - name: Write fdmball/codec.py
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'fdmball/codec.py')"
+          cat > 'fdmball/codec.py' <<'__EOF__'
+          """境界の変換(JSON ⇔ ドメイン値)。壊れた入力は例外でなく None で返す。"""
+
+          from __future__ import annotations
+
+          import json
+          from typing import cast
+
+          from .domain import RADIUS, Axis, BallState, Bounced, Event, Launch, Launched, Moved, Rejected
+
+
+          def _obj(text: str) -> dict[str, object] | None:
+              try:
+                  raw: object = json.loads(text)
+              except ValueError:
+                  return None
+              if isinstance(raw, dict):
+                  return cast("dict[str, object]", raw)  # pyright: ignore[reportUnknownArgumentType]
+              return None
+
+
+          def _num(d: dict[str, object], key: str) -> float | None:
+              v = d.get(key)
+              if isinstance(v, bool) or not isinstance(v, (int, float)):
+                  return None
+              return float(v)
+
+
+          def encode_event(e: Event) -> tuple[str, str]:
+              if isinstance(e, Moved):
+                  return "moved", json.dumps({"dt": e.dt})
+              if isinstance(e, Bounced):
+                  return "bounced", json.dumps({"axis": e.axis.value})
+              if isinstance(e, Launched):
+                  return "launched", json.dumps({"x": e.x, "y": e.y, "vx": e.vx, "vy": e.vy})
+              return "rejected", json.dumps({"reason": e.reason})
+
+
+          def decode_event(kind: str, payload: str) -> Event | None:
+              d = _obj(payload)
+              if d is None:
+                  return None
+              if kind == "moved":
+                  dt = _num(d, "dt")
+                  return None if dt is None else Moved(dt)
+              if kind == "bounced":
+                  axis = d.get("axis")
+                  if axis == "x":
+                      return Bounced(Axis.X)
+                  if axis == "y":
+                      return Bounced(Axis.Y)
+                  return None
+              if kind == "launched":
+                  v = _launch_values(d)
+                  return None if v is None else Launched(*v)
+              if kind == "rejected":
+                  reason = d.get("reason")
+                  return Rejected(reason) if isinstance(reason, str) else None
+              return None
+
+
+          def _launch_values(d: dict[str, object]) -> tuple[float, float, float, float] | None:
+              x, y, vx, vy = _num(d, "x"), _num(d, "y"), _num(d, "vx"), _num(d, "vy")
+              if x is None or y is None or vx is None or vy is None:
+                  return None
+              return x, y, vx, vy
+
+
+          def encode_state(s: BallState) -> str:
+              return json.dumps({"n": s.n, "x": s.x, "y": s.y, "vx": s.vx, "vy": s.vy})
+
+
+          def decode_state(text: str) -> BallState | None:
+              d = _obj(text)
+              if d is None:
+                  return None
+              n = d.get("n")
+              v = _launch_values(d)
+              if isinstance(n, bool) or not isinstance(n, int) or v is None:
+                  return None
+              return BallState(n, *v)
+
+
+          def decode_launch(text: str) -> Launch | None:
+              d = _obj(text)
+              v = None if d is None else _launch_values(d)
+              return None if v is None else Launch(*v)
+
+
+          def to_wire(s: BallState, epoch: int, t_ms: int) -> dict[str, object]:
+              """Firebase へ流す表現(短いキー)。e=起動ID, n=連番, t=サーバ時刻ms。"""
+              return {"e": epoch, "n": s.n, "x": s.x, "y": s.y, "vx": s.vx, "vy": s.vy, "r": RADIUS, "t": t_ms}
+          __EOF__
+      - name: Write fdmball/dsl.py
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'fdmball/dsl.py')"
+          cat > 'fdmball/dsl.py' <<'__EOF__'
+          """ボール用 DSL(命令)とプログラム。命令は 2 つだけ: Load / Emit。
+
+          状態の保存は Emit(イベント追記)に一本化し、状態はイベントの射影として得る。
+          """
+
+          from __future__ import annotations
+
+          from dataclasses import dataclass
+          from typing import Union
+
+          from .domain import BallState, Command, Event, decide, fold
+          from .free import Do, Free, bind, pure, then
+
+
+          @dataclass(frozen=True)
+          class Load:
+              """現在の状態を得る。"""
+
+
+          @dataclass(frozen=True)
+          class Emit:
+              """イベントを追記する(状態はその射影)。"""
+
+              events: tuple[Event, ...]
+
+
+          Instruction = Union[Load, Emit]
+
+
+          def load() -> Free[BallState]:
+              return Do[BallState](Load())
+
+
+          def emit(events: tuple[Event, ...]) -> Free[None]:
+              return Do[None](Emit(events))
+
+
+          def handle_command(cmd: Command) -> Free[BallState]:
+              """Load → decide(純粋) → Emit → 新しい状態。再利用可能な値としてのプログラム。"""
+
+              def after_load(state: BallState) -> Free[BallState]:
+                  events = decide(state, cmd)
+                  return then(emit(events), pure(fold(state, events)))
+
+              return bind(load(), after_load)
+          __EOF__
+      - name: Write fdmball/memory.py
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'fdmball/memory.py')"
+          cat > 'fdmball/memory.py' <<'__EOF__'
+          """テスト専用の純粋インタープリタ(I/O なし)。本番は store.SqliteStore を使う。"""
+
+          from __future__ import annotations
+
+          from .domain import BallState, Event, fold
+          from .dsl import Emit, Load
+
+
+          class MemoryStore:
+              def __init__(self, initial: BallState) -> None:
+                  self.state = initial
+                  self.log: list[Event] = []
+
+              def handle(self, instr: object) -> object:
+                  if isinstance(instr, Load):
+                      return self.state
+                  if isinstance(instr, Emit):
+                      self.log.extend(instr.events)
+                      self.state = fold(self.state, instr.events)
+                      return None
+                  raise TypeError(f"unknown instruction: {instr!r}")
+          __EOF__
+      - name: Write fdmball/store.py
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'fdmball/store.py')"
+          cat > 'fdmball/store.py' <<'__EOF__'
+          """SQLite インタープリタ: Free プログラムの唯一の永続化の入口。
+
+          events: 追記専用ログ。snapshot: last_seq 付きの射影(一定間隔で更新)。
+          復元 = snapshot + (last_seq より後のイベントの再生)。
+          """
+
+          from __future__ import annotations
+
+          import sqlite3
+          from typing import cast
+
+          from .codec import decode_event, decode_state, encode_event, encode_state
+          from .domain import BallState, Event, fold
+          from .dsl import Emit, Load
+
+          SNAPSHOT_EVERY = 60  # イベント数
+          KEEP_EVENTS = 600  # スナップショットより前に残すイベント数(メモリ/ディスクの上限管理)
+
+          _SCHEMA = """
+          CREATE TABLE IF NOT EXISTS events(
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            payload TEXT NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS snapshot(
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_seq INTEGER NOT NULL,
+            state TEXT NOT NULL
+          );
+          """
+
+
+          class SqliteStore:
+              def __init__(self, path: str, initial: BallState, *, reset: bool = False) -> None:
+                  self._conn = sqlite3.connect(path)
+                  self._conn.execute("PRAGMA journal_mode=WAL")
+                  self._conn.execute("PRAGMA synchronous=NORMAL")
+                  if reset:
+                      self._conn.executescript("DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS snapshot;")
+                  self._conn.executescript(_SCHEMA)
+                  self._state, self._last_seq, self._snap_seq = self._recover(initial)
+
+              def _recover(self, initial: BallState) -> tuple[BallState, int, int]:
+                  row: tuple[int, str] | None = self._conn.execute(
+                      "SELECT last_seq, state FROM snapshot WHERE id = 1"
+                  ).fetchone()
+                  if row is None:
+                      state, snap_seq = initial, 0
+                  else:
+                      decoded = decode_state(row[1])
+                      if decoded is None:  # 壊れたスナップショットは捨てて初期化する
+                          self._conn.executescript("DELETE FROM events; DELETE FROM snapshot;")
+                          return initial, 0, 0
+                      state, snap_seq = decoded, row[0]
+                  last = snap_seq
+                  cursor = self._conn.execute(
+                      "SELECT seq, kind, payload FROM events WHERE seq > ? ORDER BY seq", (snap_seq,)
+                  )
+                  for raw in cursor:
+                      seq, kind, payload = cast("tuple[int, str, str]", raw)
+                      event = decode_event(kind, payload)
+                      if event is None:  # 壊れたログはそこで再生を止める
+                          break
+                      state = fold(state, (event,))
+                      last = seq
+                  return state, last, snap_seq
+
+              def handle(self, instr: object) -> object:
+                  if isinstance(instr, Load):
+                      return self._state
+                  if isinstance(instr, Emit):
+                      self._append(instr.events)
+                      return None
+                  raise TypeError(f"unknown instruction: {instr!r}")
+
+              def _append(self, events: tuple[Event, ...]) -> None:
+                  if not events:
+                      return
+                  new_state = fold(self._state, events)
+                  with self._conn:  # 1 コマンド = 1 トランザクション(原子的)
+                      last = self._last_seq
+                      for event in events:
+                          kind, payload = encode_event(event)
+                          rowid = self._conn.execute(
+                              "INSERT INTO events(kind, payload) VALUES (?, ?)", (kind, payload)
+                          ).lastrowid
+                          if rowid is None:
+                              raise RuntimeError("INSERT returned no rowid")
+                          last = rowid
+                      snap_seq = self._snap_seq
+                      if last - snap_seq >= SNAPSHOT_EVERY:
+                          self._conn.execute(
+                              "INSERT INTO snapshot(id, last_seq, state) VALUES (1, ?, ?) "
+                              "ON CONFLICT(id) DO UPDATE SET last_seq = excluded.last_seq, state = excluded.state",
+                              (last, encode_state(new_state)),
+                          )
+                          self._conn.execute("DELETE FROM events WHERE seq <= ?", (last - KEEP_EVENTS,))
+                          snap_seq = last
+                  self._state, self._last_seq, self._snap_seq = new_state, last, snap_seq
+
+              def close(self) -> None:
+                  self._conn.close()
+          __EOF__
+      - name: Write fdmball/publish.py
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'fdmball/publish.py')"
+          cat > 'fdmball/publish.py' <<'__EOF__'
+          """Firebase Realtime Database への配信(REST/標準ライブラリのみ)。
+
+          送信側も「最新1件のみ」保持する。回線が詰まっても古い状態は溜めず捨てる。
+          """
+
+          from __future__ import annotations
+
+          import json
+          import threading
+          import urllib.parse
+          import urllib.request
+          from typing import Callable
+
+
+          class FirebasePublisher:
+              def __init__(self, db_url: str, room: str, auth: str | None, log: Callable[[str], None]) -> None:
+                  self._base = db_url.rstrip("/")
+                  self._room = urllib.parse.quote(room, safe="")
+                  self._auth = auth
+                  self._log = log
+                  self._slot: dict[str, object] | None = None
+                  self._lock = threading.Lock()
+                  self._wake = threading.Event()
+                  self._stop = threading.Event()
+                  self._thread = threading.Thread(target=self._run, name="publisher", daemon=True)
+
+              def start(self) -> None:
+                  self._thread.start()
+
+              def submit(self, payload: dict[str, object]) -> None:
+                  with self._lock:
+                      self._slot = payload  # 未送信の古い値は上書きされて捨てられる
+                  self._wake.set()
+
+              def put_now(self, name: str, payload: dict[str, object]) -> None:
+                  try:
+                      self._put(name, payload)
+                  except OSError as exc:
+                      self._log(f"publish {name} failed: {exc}")
+
+              def close(self) -> None:
+                  self._stop.set()
+                  self._wake.set()
+                  self._thread.join(timeout=2.0)
+
+              def _run(self) -> None:
+                  while not self._stop.is_set():
+                      self._wake.wait(1.0)
+                      with self._lock:
+                          payload, self._slot = self._slot, None
+                          self._wake.clear()
+                      if payload is None:
+                          continue
+                      try:
+                          self._put("state", payload)
+                      except OSError as exc:
+                          self._log(f"publish failed: {exc}")
+                          self._stop.wait(1.0)
+
+              def _put(self, name: str, payload: dict[str, object]) -> None:
+                  query = f"?auth={urllib.parse.quote(self._auth, safe='')}" if self._auth else ""
+                  url = f"{self._base}/rooms/{self._room}/{name}.json{query}"
+                  request = urllib.request.Request(
+                      url,
+                      data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+                      method="PUT",
+                      headers={"Content-Type": "application/json"},
+                  )
+                  with urllib.request.urlopen(request, timeout=5) as response:
+                      response.read()
+          __EOF__
+      - name: Write fdmball/__main__.py
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'fdmball/__main__.py')"
+          cat > 'fdmball/__main__.py' <<'__EOF__'
+          """命令的シェル: 時計・HTTP制御口・Firebase配信だけを持つ。ドメインは一切知らない。"""
+
+          from __future__ import annotations
+
+          import argparse
+          import json
+          import os
+          import queue
+          import sys
+          import threading
+          import time
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from typing import Sequence
+
+          from .codec import decode_launch, to_wire
+          from .domain import BallState, Command, Tick, initial_state
+          from .dsl import handle_command
+          from .free import run
+          from .publish import FirebasePublisher
+          from .store import SqliteStore
+
+
+          class Shared:
+              """メインループが書き、HTTP スレッドが読む最新状態(ロック付き)。"""
+
+              def __init__(self, state: BallState, epoch: int) -> None:
+                  self._lock = threading.Lock()
+                  self._state = state
+                  self.epoch = epoch
+
+              def set(self, state: BallState) -> None:
+                  with self._lock:
+                      self._state = state
+
+              def get(self) -> BallState:
+                  with self._lock:
+                      return self._state
+
+
+          def bind_free_port_server(shared: Shared, commands: "queue.Queue[Command]") -> ThreadingHTTPServer:
+              """ポート 0 で bind し、OS が割り当てた空きポートを使う(調べてから bind する競合がない)。"""
+
+              class Handler(BaseHTTPRequestHandler):
+                  def _reply(self, code: int, body: dict[str, object]) -> None:
+                      data = json.dumps(body).encode("utf-8")
+                      self.send_response(code)
+                      self.send_header("Content-Type", "application/json")
+                      self.send_header("Content-Length", str(len(data)))
+                      self.end_headers()
+                      self.wfile.write(data)
+
+                  def do_GET(self) -> None:
+                      if self.path == "/state":
+                          self._reply(200, to_wire(shared.get(), shared.epoch, int(time.time() * 1000)))
+                      elif self.path == "/health":
+                          self._reply(200, {"ok": True})
+                      else:
+                          self._reply(404, {"error": "not_found"})
+
+                  def do_POST(self) -> None:
+                      if self.path != "/launch":
+                          self._reply(404, {"error": "not_found"})
+                          return
+                      length = min(int(self.headers.get("Content-Length", "0") or "0"), 1024)
+                      launch = decode_launch(self.rfile.read(length).decode("utf-8", "replace"))
+                      if launch is None:
+                          self._reply(400, {"error": "bad_launch"})
+                          return
+                      commands.put(launch)  # 検証はドメイン(decide)が行い、不正なら Rejected になる
+                      self._reply(202, {"queued": True})
+
+                  def log_message(self, format: str, *args: object) -> None:
+                      return
+
+              return ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+
+
+          def main(argv: Sequence[str] | None = None) -> int:
+              p = argparse.ArgumentParser(prog="fdmball")
+              p.add_argument("--db-url", default=os.environ.get("FIREBASE_DB_URL", ""), help="Firebase RTDB の URL")
+              p.add_argument("--room", default="main")
+              p.add_argument("--sqlite", default="fdm_ball.sqlite3")
+              p.add_argument("--reset", action="store_true", help="SQLite を初期化して始める")
+              p.add_argument("--hz", type=int, default=30, help="シミュレーション周波数")
+              p.add_argument("--publish-every", type=int, default=3, help="何ティックごとに配信するか")
+              args = p.parse_args(argv)
+              if not args.db_url:
+                  print("--db-url か環境変数 FIREBASE_DB_URL を指定してください", file=sys.stderr)
+                  return 2
+
+              def log(message: str) -> None:
+                  print(message, flush=True)
+
+              hz: int = args.hz
+              every: int = args.publish_every
+              dt = 1.0 / hz
+              epoch = int(time.time())
+              store = SqliteStore(args.sqlite, initial_state(), reset=args.reset)
+              state = run(handle_command(Tick(dt)), store.handle)  # 復元後の最初の状態
+              shared = Shared(state, epoch)
+              commands: "queue.Queue[Command]" = queue.Queue()
+              server = bind_free_port_server(shared, commands)
+              port = int(server.server_address[1])
+              threading.Thread(target=server.serve_forever, name="control", daemon=True).start()
+
+              publisher = FirebasePublisher(args.db_url, args.room, os.environ.get("FIREBASE_AUTH"), log)
+              publisher.start()
+              publisher.put_now("meta", {"e": epoch, "port": port, "hz": hz, "t": int(time.time() * 1000)})
+              log(f"control http: 127.0.0.1:{port}  room={args.room}  epoch={epoch}")
+
+              counter = 0
+              next_at = time.monotonic()
+              try:
+                  while True:
+                      while True:
+                          try:
+                              cmd = commands.get_nowait()
+                          except queue.Empty:
+                              break
+                          run(handle_command(cmd), store.handle)
+                      state = run(handle_command(Tick(dt)), store.handle)
+                      shared.set(state)
+                      counter = (counter + 1) % every
+                      if counter == 0:
+                          publisher.submit(to_wire(state, epoch, int(time.time() * 1000)))
+                      next_at += dt
+                      delay = next_at - time.monotonic()
+                      if delay > 0:
+                          time.sleep(delay)
+                      elif delay < -1.0:  # 大きく遅れたら追いつかず仕切り直す
+                          next_at = time.monotonic()
+              except KeyboardInterrupt:
+                  log("stopping")
+              finally:
+                  server.shutdown()
+                  server.server_close()
+                  publisher.close()
+                  store.close()
+              return 0
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          __EOF__
+      - name: Write tests/__init__.py
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'tests/__init__.py')"
+          : > 'tests/__init__.py'
+      - name: Write tests/test_free.py
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'tests/test_free.py')"
+          cat > 'tests/test_free.py' <<'__EOF__'
+          import unittest
+
+          from fdmball.domain import initial_state
+          from fdmball.dsl import emit, load
+          from fdmball.domain import Tick, decide
+          from fdmball.free import Free, bind, pure, run
+          from fdmball.memory import MemoryStore
+
+
+          def _exec(program: Free[int]) -> tuple[int, int]:
+              store = MemoryStore(initial_state())
+              result = run(program, store.handle)
+              return result, len(store.log)
+
+
+          def _f(x: int) -> Free[int]:
+              return bind(load(), lambda s: bind(emit(decide(s, Tick(0.01))), lambda _: pure(x + 1)))
+
+
+          def _g(x: int) -> Free[int]:
+              return bind(emit(decide(initial_state(), Tick(0.02))), lambda _: pure(x * 2))
+
+
+          class MonadLaws(unittest.TestCase):
+              def test_left_identity(self) -> None:
+                  self.assertEqual(_exec(bind(pure(3), _f)), _exec(_f(3)))
+
+              def test_right_identity(self) -> None:
+                  m = _f(3)
+                  self.assertEqual(_exec(bind(m, pure)), _exec(m))
+
+              def test_associativity(self) -> None:
+                  m = _f(3)
+                  left = bind(bind(m, _g), _f)
+                  right = bind(m, lambda x: bind(_g(x), _f))
+                  self.assertEqual(_exec(left), _exec(right))
+
+
+          class StackSafety(unittest.TestCase):
+              def test_deep_left_nested_bind(self) -> None:
+                  program: Free[int] = pure(0)
+                  for _ in range(100_000):
+                      program = bind(program, lambda x: pure(x + 1))
+                  self.assertEqual(run(program, MemoryStore(initial_state()).handle), 100_000)
+
+
+          if __name__ == "__main__":
+              unittest.main()
+          __EOF__
+      - name: Write tests/test_domain.py
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'tests/test_domain.py')"
+          cat > 'tests/test_domain.py' <<'__EOF__'
+          import unittest
+
+          from fdmball.domain import (
+              RADIUS,
+              Axis,
+              BallState,
+              Bounced,
+              Launch,
+              Launched,
+              Moved,
+              Rejected,
+              Tick,
+              decide,
+              evolve,
+              fold,
+              initial_state,
+          )
+
+
+          class Decide(unittest.TestCase):
+              def test_invalid_dt_is_rejected(self) -> None:
+                  for dt in (0.0, -1.0, 0.5, float("nan"), float("inf")):
+                      self.assertEqual(decide(initial_state(), Tick(dt)), (Rejected("invalid_dt"),))
+
+              def test_launch_validation(self) -> None:
+                  s = initial_state()
+                  self.assertIsInstance(decide(s, Launch(0.5, 0.5, 1.0, 1.0))[0], Launched)
+                  self.assertEqual(decide(s, Launch(0.0, 0.5, 1.0, 1.0)), (Rejected("launch_outside_field"),))
+                  self.assertEqual(decide(s, Launch(0.5, 0.5, 9.0, 1.0)), (Rejected("launch_too_fast"),))
+                  self.assertEqual(decide(s, Launch(float("nan"), 0.5, 1.0, 1.0)), (Rejected("non_finite_launch"),))
+
+              def test_bounce_events(self) -> None:
+                  s = BallState(0, 1.0 - RADIUS - 0.001, 0.5, 1.0, 0.0)
+                  self.assertEqual(decide(s, Tick(0.1)), (Moved(0.1), Bounced(Axis.X)))
+
+
+          class Invariants(unittest.TestCase):
+              def test_ball_never_leaves_field(self) -> None:
+                  for vx, vy, dt in ((3.0, 2.9, 0.1), (0.31, 0.47, 1 / 30), (-2.5, 1.7, 0.05), (0.0, -3.0, 0.1)):
+                      s = BallState(0, 0.37, 0.61, vx, vy)
+                      for _ in range(20_000):
+                          s = fold(s, decide(s, Tick(dt)))
+                          self.assertTrue(RADIUS <= s.x <= 1.0 - RADIUS, s)
+                          self.assertTrue(RADIUS <= s.y <= 1.0 - RADIUS, s)
+
+              def test_rejected_does_not_change_state(self) -> None:
+                  s = initial_state()
+                  self.assertEqual(evolve(s, Rejected("x")), s)
+
+              def test_n_is_monotonic(self) -> None:
+                  s = initial_state()
+                  for i in range(1, 100):
+                      s = fold(s, decide(s, Tick(0.01)))
+                      self.assertEqual(s.n, i)
+
+
+          if __name__ == "__main__":
+              unittest.main()
+          __EOF__
+      - name: Write tests/test_store.py
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'tests/test_store.py')"
+          cat > 'tests/test_store.py' <<'__EOF__'
+          import os
+          import tempfile
+          import unittest
+
+          from fdmball.domain import Command, Launch, Tick, initial_state
+          from fdmball.dsl import handle_command
+          from fdmball.free import run
+          from fdmball.memory import MemoryStore
+          from fdmball.store import SNAPSHOT_EVERY, SqliteStore
+
+
+
+          def _commands() -> list[Command]:
+              cmds: list[Command] = [Tick(1 / 30) for _ in range(500)]
+              cmds.append(Launch(0.2, 0.8, -1.5, 0.9))
+              cmds.extend(Tick(1 / 30) for _ in range(500))
+              return cmds
+
+
+          COMMANDS = _commands()
+
+
+          class Contract(unittest.TestCase):
+              """メモリ版と SQLite 版は同じプログラムに同じ結果を返す。"""
+
+              def test_same_result(self) -> None:
+                  mem = MemoryStore(initial_state())
+                  with tempfile.TemporaryDirectory() as d:
+                      sql = SqliteStore(os.path.join(d, "t.sqlite3"), initial_state())
+                      for cmd in COMMANDS:
+                          a = run(handle_command(cmd), mem.handle)
+                          b = run(handle_command(cmd), sql.handle)
+                          self.assertEqual(a, b)
+                      sql.close()
+
+
+          class Recovery(unittest.TestCase):
+              def test_restore_from_snapshot_plus_replay(self) -> None:
+                  with tempfile.TemporaryDirectory() as d:
+                      path = os.path.join(d, "t.sqlite3")
+                      first = SqliteStore(path, initial_state())
+                      last = initial_state()
+                      for _ in range(SNAPSHOT_EVERY * 3 + 7):  # スナップショット間隔の途中で止める
+                          last = run(handle_command(Tick(1 / 30)), first.handle)
+                      first.close()
+                      second = SqliteStore(path, initial_state())
+                      restored = run(handle_command(Tick(1 / 30)), second.handle)
+                      expected = run(handle_command(Tick(1 / 30)), MemoryStore(last).handle)
+                      self.assertEqual(restored, expected)
+                      second.close()
+
+              def test_reset_starts_fresh(self) -> None:
+                  with tempfile.TemporaryDirectory() as d:
+                      path = os.path.join(d, "t.sqlite3")
+                      first = SqliteStore(path, initial_state())
+                      for _ in range(200):
+                          run(handle_command(Tick(1 / 30)), first.handle)
+                      first.close()
+                      fresh = SqliteStore(path, initial_state(), reset=True)
+                      self.assertEqual(run(handle_command(Tick(1 / 30)), fresh.handle).n, 1)
+                      fresh.close()
+
+
+          if __name__ == "__main__":
+              unittest.main()
+          __EOF__
+      - name: Write docs/index.html
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'docs/index.html')"
+          cat > 'docs/index.html' <<'__EOF__'
+          <!doctype html>
+          <html lang="ja">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>FDM Ball</title>
+          <style>
+            :root { color-scheme: dark; --bg:#0b0f1a; --fg:#cfe3ff; --accent:#4de1ff; }
+            html,body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui,sans-serif; }
+            main { min-height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; padding:8px; box-sizing:border-box; }
+            canvas { width:min(94vw,72vh); aspect-ratio:1; background:#05070d; border:2px solid #1d2a44; border-radius:8px; }
+            #hud { margin:0; font:12px/1.5 ui-monospace,monospace; opacity:.85; text-align:center; }
+          </style>
+          </head>
+          <body>
+          <main>
+            <canvas id="c"></canvas>
+            <pre id="hud">connecting…</pre>
+          </main>
+          <script src="config.js"></script>
+          <script type="module">
+          import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
+          import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
+
+          const hud = document.getElementById("hud");
+          const canvas = document.getElementById("c");
+          const ctx = canvas.getContext("2d");
+          const room = new URLSearchParams(location.search).get("room") ?? "main";
+
+          if (!window.FIREBASE_CONFIG) {
+            hud.textContent = "docs/config.js に Firebase 設定がありません";
+            throw new Error("missing FIREBASE_CONFIG");
+          }
+          const db = getDatabase(initializeApp(window.FIREBASE_CONFIG));
+
+          // ---- 受信側コンフレーション -------------------------------------------
+          // 受信コールバックは「最新1件」を上書きするだけ。描画は rAF で最新1件のみ読む。
+          // 回線の揺らぎで複数件がまとめて届いても、古いものは描画せず捨てる。
+          let latest = null;       // { e, n, x, y, vx, vy, r, at, drawn }
+          let received = 0, conflated = 0, stale = 0, connected = false;
+
+          onValue(ref(db, ".info/connected"), (s) => { connected = s.val() === true; });
+          onValue(ref(db, `rooms/${room}/state`), (snap) => {
+            const v = snap.val();
+            if (!v || typeof v.n !== "number") return;
+            if (latest && v.e === latest.e && v.n <= latest.n) { stale++; return; } // 古い・重複は捨てる
+            if (latest && !latest.drawn) conflated++;                                // 未描画のまま上書き
+            latest = { ...v, at: performance.now(), drawn: false };
+            received++;
+          });
+
+          // ---- 描画(論理座標 0..1 → 画素変換はここだけ) -------------------------
+          // 反射を跨いでも位置が壁の内側に収まるように三角波で折り返す。
+          function fold(p, lo, hi) {
+            const L = hi - lo;
+            let q = (p - lo) % (2 * L);
+            if (q < 0) q += 2 * L;
+            return lo + (q > L ? 2 * L - q : q);
+          }
+
+          let shown = null, prev = performance.now();
+          const trail = [];
+
+          function resize() {
+            const dpr = window.devicePixelRatio || 1;
+            const size = Math.round(canvas.clientWidth * dpr);
+            if (canvas.width !== size) { canvas.width = size; canvas.height = size; }
+          }
+
+          function frame(now) {
+            requestAnimationFrame(frame);
+            resize();
+            const W = canvas.width;
+            ctx.clearRect(0, 0, W, W);
+            if (latest) {
+              latest.drawn = true;
+              const dt = Math.min((now - latest.at) / 1000, 0.3);          // 外挿は最大 0.3 秒
+              const tx = fold(latest.x + latest.vx * dt, latest.r, 1 - latest.r);
+              const ty = fold(latest.y + latest.vy * dt, latest.r, 1 - latest.r);
+              const k = shown ? 1 - Math.exp(-(now - prev) / 1000 * 25) : 1; // 揺らぎを均す
+              shown = shown ? { x: shown.x + (tx - shown.x) * k, y: shown.y + (ty - shown.y) * k } : { x: tx, y: ty };
+              trail.push(shown); if (trail.length > 18) trail.shift();
+              trail.forEach((p, i) => {
+                ctx.fillStyle = `rgba(77,225,255,${(i / trail.length) * 0.25})`;
+                ctx.beginPath(); ctx.arc(p.x * W, p.y * W, latest.r * W * (0.4 + 0.6 * i / trail.length), 0, 7); ctx.fill();
+              });
+              ctx.shadowColor = "#4de1ff"; ctx.shadowBlur = 18; ctx.fillStyle = "#e8fbff";
+              ctx.beginPath(); ctx.arc(shown.x * W, shown.y * W, latest.r * W, 0, 7); ctx.fill();
+              ctx.shadowBlur = 0;
+            }
+            prev = now;
+          }
+          requestAnimationFrame(frame);
+
+          setInterval(() => {
+            const age = latest ? Math.round(performance.now() - latest.at) : "-";
+            hud.textContent =
+              `${connected ? "● online" : "○ offline"}  room=${room}  n=${latest ? latest.n : "-"}\n` +
+              `age=${age}ms  received=${received}  conflated=${conflated}  stale=${stale}`;
+          }, 250);
+          </script>
+          </body>
+          </html>
+          __EOF__
+      - name: Write docs/config.js
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'docs/config.js')"
+          cat > 'docs/config.js' <<'__EOF__'
+          // Firebase のウェブアプリ設定(JSON)に置き換える。GitHub Actions では
+          // リポジトリ変数 FIREBASE_CONFIG_JSON から自動生成される。
+          window.FIREBASE_CONFIG = null;
+          __EOF__
+      - name: Write database.rules.json
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'database.rules.json')"
+          cat > 'database.rules.json' <<'__EOF__'
+          {
+            "rules": {
+              "rooms": {
+                "$room": {
+                  ".read": true,
+                  ".write": false
+                }
+              }
+            }
+          }
+          __EOF__
+      - name: Write firebase.json
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$(dirname 'firebase.json')"
+          cat > 'firebase.json' <<'__EOF__'
+          {
+            "database": {
+              "rules": "database.rules.json"
+            }
+          }
+          __EOF__
+      - name: Commit
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "Add FDM ball: Free monad on SQLite"
+          git push
+
+  typecheck:
+    needs: materialize
+    if: ${{ !cancelled() && needs.materialize.result != 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyright
+      - name: Pyright (strict)
+        run: pyright
+      - name: unittest
+        run: python -m unittest discover -s tests -t .
+
+  pages:
+    needs: typecheck
+    if: ${{ !cancelled() && needs.typecheck.result == 'success' && github.ref_name == github.event.repository.default_branch }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      FIREBASE_CONFIG_JSON: ${{ vars.FIREBASE_CONFIG_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Generate docs/config.js from repository variable
+        run: |
+          if [ -n "$FIREBASE_CONFIG_JSON" ]; then
+            printf 'window.FIREBASE_CONFIG = %s;\n' "$FIREBASE_CONFIG_JSON" > docs/config.js
+          else
+            echo "::warning::リポジトリ変数 FIREBASE_CONFIG_JSON が未設定です"
+          fi
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+      - id: deploy
+        uses: actions/deploy-pages@v4
