@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FDM Ball</title>
+<style>
+  :root { color-scheme: dark; --bg:#0b0f1a; --fg:#cfe3ff; --accent:#4de1ff; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui,sans-serif; }
+  main { min-height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; padding:8px; box-sizing:border-box; }
+  canvas { width:min(94vw,72vh); aspect-ratio:1; background:#05070d; border:2px solid #1d2a44; border-radius:8px; }
+  #hud { margin:0; font:12px/1.5 ui-monospace,monospace; opacity:.85; text-align:center; }
+</style>
+</head>
+<body>
+<main>
+  <canvas id="c"></canvas>
+  <pre id="hud">connecting…</pre>
+</main>
+<script src="config.js"></script>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
+import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
+
+const hud = document.getElementById("hud");
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const room = new URLSearchParams(location.search).get("room") ?? "main";
+
+if (!window.FIREBASE_CONFIG) {
+  hud.textContent = "docs/config.js に Firebase 設定がありません";
+  throw new Error("missing FIREBASE_CONFIG");
+}
+const db = getDatabase(initializeApp(window.FIREBASE_CONFIG));
+
+// ---- 受信側コンフレーション -------------------------------------------
+// 受信コールバックは「最新1件」を上書きするだけ。描画は rAF で最新1件のみ読む。
+// 回線の揺らぎで複数件がまとめて届いても、古いものは描画せず捨てる。
+let latest = null;       // { e, n, x, y, vx, vy, r, at, drawn }
+let received = 0, conflated = 0, stale = 0, connected = false;
+
+onValue(ref(db, ".info/connected"), (s) => { connected = s.val() === true; });
+onValue(ref(db, `rooms/${room}/state`), (snap) => {
+  const v = snap.val();
+  if (!v || typeof v.n !== "number") return;
+  if (latest && v.e === latest.e && v.n <= latest.n) { stale++; return; } // 古い・重複は捨てる
+  if (latest && !latest.drawn) conflated++;                                // 未描画のまま上書き
+  latest = { ...v, at: performance.now(), drawn: false };
+  received++;
+});
+
+// ---- 描画(論理座標 0..1 → 画素変換はここだけ) -------------------------
+// 反射を跨いでも位置が壁の内側に収まるように三角波で折り返す。
+function fold(p, lo, hi) {
+  const L = hi - lo;
+  let q = (p - lo) % (2 * L);
+  if (q < 0) q += 2 * L;
+  return lo + (q > L ? 2 * L - q : q);
+}
+
+let shown = null, prev = performance.now();
+const trail = [];
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const size = Math.round(canvas.clientWidth * dpr);
+  if (canvas.width !== size) { canvas.width = size; canvas.height = size; }
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  resize();
+  const W = canvas.width;
+  ctx.clearRect(0, 0, W, W);
+  if (latest) {
+    latest.drawn = true;
+    const dt = Math.min((now - latest.at) / 1000, 0.3);          // 外挿は最大 0.3 秒
+    const tx = fold(latest.x + latest.vx * dt, latest.r, 1 - latest.r);
+    const ty = fold(latest.y + latest.vy * dt, latest.r, 1 - latest.r);
+    const k = shown ? 1 - Math.exp(-(now - prev) / 1000 * 25) : 1; // 揺らぎを均す
+    shown = shown ? { x: shown.x + (tx - shown.x) * k, y: shown.y + (ty - shown.y) * k } : { x: tx, y: ty };
+    trail.push(shown); if (trail.length > 18) trail.shift();
+    trail.forEach((p, i) => {
+      ctx.fillStyle = `rgba(77,225,255,${(i / trail.length) * 0.25})`;
+      ctx.beginPath(); ctx.arc(p.x * W, p.y * W, latest.r * W * (0.4 + 0.6 * i / trail.length), 0, 7); ctx.fill();
+    });
+    ctx.shadowColor = "#4de1ff"; ctx.shadowBlur = 18; ctx.fillStyle = "#e8fbff";
+    ctx.beginPath(); ctx.arc(shown.x * W, shown.y * W, latest.r * W, 0, 7); ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+  prev = now;
+}
+requestAnimationFrame(frame);
+
+setInterval(() => {
+  const age = latest ? Math.round(performance.now() - latest.at) : "-";
+  hud.textContent =
+    `${connected ? "● online" : "○ offline"}  room=${room}  n=${latest ? latest.n : "-"}\n` +
+    `age=${age}ms  received=${received}  conflated=${conflated}  stale=${stale}`;
+}, 250);
+</script>
+</body>
+</html>
